@@ -1,0 +1,39 @@
+IndustrialDeviceCommunication
+Copyright 2026 fangxinghui
+
+This repository is licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+The Apache-2.0 terms apply to material for which fangxinghui is the copyright holder. P/Invoke declarations for ZLG, NI-DAQmx, ART-DAQ, and the Advantech Automation.BDaq reflection wrapper are written in this repository from the public function names, parameter types, and calling conventions. They contain only the entries this library calls. They are not vendor sample listings.
+
+Names below identify third-party products. This repository does not grant rights to those products and does not contain their binaries.
+
+- Advantech DAQNavi, Automation.BDaq, and Automation.BDaq4 (Advantech).
+  There is no compile-time reference and nothing is packed. Digital I/O loads Automation.BDaq.dll at runtime from the application directory, or from a path passed to BDaqInterop. Install Advantech DAQNavi yourself. The previous tree also copied Automation.BDaq4.dll beside the app; this code does not reference that assembly.
+
+- Beckhoff TwinCAT ADS (Beckhoff Automation), NuGet packages Beckhoff.TwinCAT.Ads and Beckhoff.TwinCAT.Ads.TcpRouter 7.0.172.
+  They are package dependencies. Costura does not embed TwinCAT.Ads or TwinCAT.Ads.TcpRouter, and those assemblies are not added as package content. Beckhoff's own license applies to those packages.
+
+- NI-DAQmx and NI-VISA (National Instruments), plus the IVI VISA library used through the IviFoundation.Visa package on net9.0.
+  Native NI runtimes are not included. USB VISA communication checks for a Windows VISA runtime at run time.
+
+- ZLG CAN (ZLG / 致远电子). Native ZLG libraries are not included.
+  DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs declares the zlgcan.dll entry points and pack-1 structs this library calls. The declaration file is independently written.
+
+- Omron FINS (Omron). DeviceCommunication/Protocols/Omron/OmronFinsTcp.cs calls HslCommunication. It is compiled only when you build with IncludeHslDrivers=true and a local HslCommunication.dll.
+
+- Siemens SIMATIC S7 (Siemens). DeviceCommunication/Protocols/Siemens/SiemensNet.cs calls HslCommunication and is compiled only under that same opt-in. The default build compiles SiemensNet.Stub.cs instead, which does not reference Hsl.
+
+- ART-DAQ / 阿尔泰 (ART Technology, Altai, 北京阿尔泰科技). Adapters P/Invoke Art_DAQ.dll from an ART-DAQ installation. That DLL is not included.
+
+HslCommunication (杭州胡工物联科技有限公司, https://www.hsltechnology.cn/) is not in this repository and is not packed into the NuGet package. Install a copy you are licensed to use before enabling the Siemens and Omron drivers.
+
+Interop declarations written in this tree, limited to the calls the rest of the code makes:
+
+- DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs
+- DeviceCommunication/Protocols/IOCard/NationalInstruments/NIDaqNative.cs
+- DeviceCommunication/Protocols/IOCard/NationalInstruments/NIDaqInterop.cs
+- DeviceCommunication/Protocols/IOCard/ArtTechnology/ArtDaqNative.cs
+- DeviceCommunication/Protocols/IOCard/ArtTechnology/ArtDaqInterop.cs
+- DeviceCommunication/Protocols/IOCard/BDaqInterop.cs
+
+Costura.Fody still embeds Newtonsoft.Json (MIT), FluentModbus (MIT), SerialPortStream / RJCP.SerialPortStream (MS-PL), HPSocket.Net, and the HPSocket4C native binary into DeviceCommunication.dll. HPSocket.Net 6.0.7.1 does not declare an SPDX license in its NuGet manifest. Those embedded components keep their own terms.

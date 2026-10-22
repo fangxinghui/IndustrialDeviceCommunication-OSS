@@ -1,0 +1,83 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFrameworks>netstandard2.1;net9.0</TargetFrameworks>
+        <Nullable>enable</Nullable>
+        <!-- Siemens/Omron drivers compile only when a local HslCommunication.dll is supplied. -->
+        <IncludeHslDrivers Condition="'$(IncludeHslDrivers)' == ''">false</IncludeHslDrivers>
+        <IncludeHslDrivers>$([System.String]::Copy('$(IncludeHslDrivers)').ToLowerInvariant())</IncludeHslDrivers>
+    </PropertyGroup>
+    <PropertyGroup>
+        <PackageId>DeviceCommunication</PackageId>
+        <Version>1.0.5</Version>
+        <Authors>fangxinghui</Authors>
+        <Company>fangxinghui</Company>
+        <Description>Industrial device communication library (PLC, Modbus, CAN, TCP, MQTT, serial, VISA, DAQ). Vendor runtimes are not bundled.</Description>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <RepositoryUrl>https://github.com/fangxinghui/IndustrialDeviceCommunication-OSS</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+    </PropertyGroup>
+    <ItemGroup>
+      <!-- Declared as dependencies so they are not copied into this package. -->
+      <PackageReference Include="Beckhoff.TwinCAT.Ads" Version="7.0.172" />
+      <PackageReference Include="Beckhoff.TwinCAT.Ads.TcpRouter" Version="7.0.172" />
+      <PackageReference Include="Costura.Fody" Version="6.2.0">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+
+      <PackageReference Include="FluentModbus" Version="5.3.2">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+      <PackageReference Include="HPSocket.Net" Version="6.0.7.1">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+      <PackageReference Include="MQTTnet" Version="4.3.7.1207">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+      <PackageReference Include="Newtonsoft.Json" Version="13.0.4">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+      <PackageReference Include="SerialPortStream" Version="2.4.2">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+      <PackageReference Include="Microsoft.CSharp" Version="4.7.0">
+        <PrivateAssets>all</PrivateAssets>
+      </PackageReference>
+      <PackageReference Include="System.IO.Ports" Version="10.0.9" />
+      <PackageReference Include="System.Xml.XmlSerializer" Version="4.3.0" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+      <PackageReference Include="IviFoundation.Visa" Version="8.0.2" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(IncludeHslDrivers)' == 'true'">
+      <Reference Include="HslCommunication">
+        <HintPath>$(HslCommunicationDll)</HintPath>
+        <!-- Do not copy or pack the caller's Hsl binary. -->
+        <Private>false</Private>
+      </Reference>
+    </ItemGroup>
+    <ItemGroup Condition="'$(IncludeHslDrivers)' != 'true'">
+      <Compile Remove="Protocols/Omron/OmronFinsTcp.cs" />
+      <Compile Remove="Protocols/Siemens/SiemensNet.cs" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(IncludeHslDrivers)' == 'true'">
+      <Compile Remove="Protocols/Siemens/SiemensNet.Stub.cs" />
+    </ItemGroup>
+    <ItemGroup>
+      <EmbeddedResource Include="Resources\**\*" />
+      <None Include="..\README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\CoreShared\CoreShared.csproj" />
+    </ItemGroup>
+
+    <Target Name="EnsureHslCommunicationDll" BeforeTargets="ResolveAssemblyReferences" Condition="'$(IncludeHslDrivers)' == 'true'">
+      <Error Condition="'$(HslCommunicationDll)' == '' OR !Exists('$(HslCommunicationDll)')"
+             Text="IncludeHslDrivers=true requires -p:HslCommunicationDll=/path/to/HslCommunication.dll. This repository does not ship HslCommunication." />
+    </Target>
+
+</Project>
