@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using CoreShared.Events;
 using CoreShared.Interfaces;
@@ -8,41 +9,31 @@ using CoreShared.Interfaces;
 namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
 {
     /// <summary>
-    /// NI-DAQmx 原生 API（nicaiu.dll）封装层。
-    ///
-    /// 规避 -50405（USB transfer aborted）的关键策略：
-    /// 1. 任务常驻：AI/DI/DO/AO 每个通道(线)各建一个 Task 并缓存复用，
-    ///    轮询多通道时不再 Clear/Create 循环（Task 频繁重建正是 USB 传输被 abort 的主因）；
-    /// 2. 单点读写全部依赖 Read/Write 的 auto-start，不显式 Start/Stop；
-    /// 3. 一旦出现 -50405/-50103，设备已进入坏状态，仅重建 Task 无效，
-    ///    需 ClearAll + DAQmxResetDevice 后重建（带 5s 节流，避免复位风暴）。
+    /// Keeps one NI-DAQmx task per analog channel or digital line and reads or writes through nicaiu.dll.
+    /// USB transfer abort (-50405) and resource reserved (-50103) clear those tasks and, at most once
+    /// every five seconds, reset the device before the call is retried.
     /// </summary>
     internal sealed class NIDaqInterop : ILogEvent, IDisposable
     {
-        private const int ErrorTransferAborted = -50405;
-        private const int ErrorResourceReserved = -50103;
-        private static readonly TimeSpan ResetThrottle = TimeSpan.FromSeconds(5);
+        private const int UsbTransferAborted = -50405;
+        private const int ResourceReserved = -50103;
+        private const int UnsupportedTerminal = -200077;
+        private static readonly TimeSpan ResetInterval = TimeSpan.FromSeconds(5);
 
-        private readonly object _sync = new();
-
-        // 常驻任务缓存：key → taskHandle
-        private readonly Dictionary<string, IntPtr> _aiTasks = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, IntPtr> _diTasks = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, IntPtr> _doTasks = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, IntPtr> _aoTasks = new(StringComparer.OrdinalIgnoreCase);
+        private readonly object _gate = new();
+        private readonly Dictionary<string, IntPtr> _analogInputs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, IntPtr> _analogOutputs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, IntPtr> _digitalInputs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, IntPtr> _digitalOutputs = new(StringComparer.OrdinalIgnoreCase);
 
         private string _deviceName = string.Empty;
         private bool _disposed;
         private DateTime _lastResetUtc = DateTime.MinValue;
-
-        // 当前 AI 选择（ConfigureAiChannel 设定，ReadAiSinglePoint 使用）
         private string? _aiKey;
         private string? _aiChannel;
         private double _aiMin;
         private double _aiMax;
-        private int _aiTerm = int.MinValue;
-
-        // 当前 AO 选择
+        private int _aiTerminal = int.MinValue;
         private string? _aoKey;
         private string? _aoChannel;
         private double _aoMin;
@@ -56,101 +47,62 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
 
         public bool Initialize(string deviceName)
         {
-            lock (_sync)
+            lock (_gate)
             {
                 try
                 {
-                    WriteLog(nameof(Initialize), $"Loading nicaiu.dll, requested device='{deviceName}'.");
-                    _deviceName = ResolveDeviceName(deviceName);
-                    ClearAllTasks();
+                    PublishLog(nameof(Initialize), $"Loading nicaiu.dll, requested device='{deviceName}'.");
+                    _deviceName = PickDeviceName(deviceName);
+                    ReleaseEveryTask();
                     Initialized = true;
-                    WriteLog(nameof(Initialize), $"Initialized successfully. Device='{_deviceName}'.");
+                    PublishLog(nameof(Initialize), $"Initialized successfully. Device='{_deviceName}'.");
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    WriteException(nameof(Initialize), ex);
+                    PublishException(nameof(Initialize), ex);
                     Initialized = false;
                     return false;
                 }
             }
         }
 
-        public IReadOnlyList<string> EnumerateDevices()
-        {
-            try
-            {
-                var buffer = new byte[4096];
-                NIDaqNative.ThrowIfFailed(
-                    NIDaqNative.DAQmxGetSystemInfoAttribute(NIDaqNative.SysDevNames, buffer, buffer.Length),
-                    nameof(NIDaqNative.DAQmxGetSystemInfoAttribute));
-
-                var text = System.Text.Encoding.ASCII.GetString(buffer);
-                var nullIndex = text.IndexOf('\0');
-                if (nullIndex >= 0)
-                    text = text[..nullIndex];
-
-                return text
-                    .Split(new[] { ',', '\0' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Select(s => s.Trim())
-                    .Where(s => !string.IsNullOrWhiteSpace(s))
-                    .OrderBy(s => s)
-                    .ToList();
-            }
-            catch
-            {
-                return Array.Empty<string>();
-            }
-        }
-
-        public bool IsDevicePresent(string name)
-        {
-            return EnumerateDevices().Any(d =>
-                d.Equals(name, StringComparison.OrdinalIgnoreCase));
-        }
-
-        // ═══════════════════ AI ═══════════════════
-
-        public void ConfigureAiChannel(string physicalChannel,
+        public void ConfigureAiChannel(
+            string physicalChannel,
             double minimumValue = -10.0,
             double maximumValue = 10.0,
             int terminalConfig = NIDaqNative.ValCfgDefault)
         {
-            lock (_sync)
+            lock (_gate)
             {
-                EnsureInitialized();
-
-                // 兼容旧托管枚举：2 ≈ Differential
+                RequireReady();
                 if (terminalConfig == 2)
                     terminalConfig = NIDaqNative.ValDiff;
 
                 var key = AiKey(physicalChannel, minimumValue, maximumValue, terminalConfig);
-                if (_aiTasks.ContainsKey(key))
+                if (_analogInputs.ContainsKey(key))
                 {
-                    SetCurrentAi(key, physicalChannel, minimumValue, maximumValue, terminalConfig);
+                    RememberAi(key, physicalChannel, minimumValue, maximumValue, terminalConfig);
                     return;
                 }
 
-                CreateAndCacheAiTask(physicalChannel, minimumValue, maximumValue, terminalConfig);
+                OpenAndStoreAi(physicalChannel, minimumValue, maximumValue, terminalConfig);
             }
         }
 
         public double ReadAiSinglePoint(int timeoutMs = 5000)
         {
-            lock (_sync)
+            lock (_gate)
             {
-                EnsureInitialized();
-                var task = CurrentAiTask();
-
-                // on-demand 单点：不显式 Start/Stop，由 Read auto-start
+                RequireReady();
+                var task = AiTaskOrThrow();
                 var error = NIDaqNative.DAQmxReadAnalogScalarF64(
                     task, timeoutMs / 1000.0, out var value, IntPtr.Zero);
 
-                if (IsUsbAbortError(error) && TryRecoverDevice("AI read"))
+                if (IsAbort(error) && ResetAfterAbort("AI read"))
                 {
-                    // 复位后所有 Task 失效，重建当前 AI 再试一次
-                    CreateAndCacheAiTask(_aiChannel!, _aiMin, _aiMax, _aiTerm);
-                    task = CurrentAiTask();
+                    OpenAndStoreAi(_aiChannel!, _aiMin, _aiMax, _aiTerminal);
+                    task = AiTaskOrThrow();
                     error = NIDaqNative.DAQmxReadAnalogScalarF64(
                         task, timeoutMs / 1000.0, out value, IntPtr.Zero);
                 }
@@ -162,17 +114,16 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
 
         public double[] ReadAiWaveform(int samples, int timeoutMs = 5000)
         {
-            lock (_sync)
+            lock (_gate)
             {
-                EnsureInitialized();
+                RequireReady();
                 if (string.IsNullOrWhiteSpace(_aiChannel))
                     throw new InvalidOperationException("AI channel not configured. Call ConfigureAiChannel first.");
 
                 if (samples <= 0)
                     return Array.Empty<double>();
 
-                // 波形读用独立临时 Task（带采样时钟），不污染常驻单点 Task
-                var (tempTask, _) = CreateAiTaskCore(_aiChannel, _aiMin, _aiMax, _aiTerm);
+                var (tempTask, _) = OpenAiTask(_aiChannel, _aiMin, _aiMax, _aiTerminal);
                 try
                 {
                     NIDaqNative.ThrowIfFailed(
@@ -184,7 +135,6 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
                             NIDaqNative.ValFiniteSamps,
                             (ulong)samples),
                         nameof(NIDaqNative.DAQmxCfgSampClkTiming));
-
                     NIDaqNative.ThrowIfFailed(
                         NIDaqNative.DAQmxStartTask(tempTask),
                         nameof(NIDaqNative.DAQmxStartTask));
@@ -204,44 +154,39 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
 
                     if (read <= 0)
                     {
-                        WriteLog(nameof(ReadAiWaveform), "AI waveform read returned empty data.");
+                        PublishLog(nameof(ReadAiWaveform), "AI waveform read returned empty data.");
                         return Array.Empty<double>();
                     }
 
                     if (read < data.Length)
                         Array.Resize(ref data, read);
-
                     return data;
                 }
                 finally
                 {
-                    ClearTask(ref tempTask);
+                    ReleaseOne(ref tempTask);
                 }
             }
         }
 
-        /// <summary>兼容旧调用：常驻缓存模式下波形读已用临时 Task，无需释放。</summary>
         internal void ReleaseTask()
         {
         }
 
-        // ═══════════════════ AO ═══════════════════
-
-        public void ConfigureAoChannel(string physicalChannel,
+        public void ConfigureAoChannel(
+            string physicalChannel,
             double minimumValue = -10.0,
             double maximumValue = 10.0)
         {
-            lock (_sync)
+            lock (_gate)
             {
-                EnsureInitialized();
-
+                RequireReady();
                 var key = $"{physicalChannel}|{minimumValue}|{maximumValue}";
-                if (!_aoTasks.ContainsKey(key))
+                if (!_analogOutputs.ContainsKey(key))
                 {
                     NIDaqNative.ThrowIfFailed(
                         NIDaqNative.DAQmxCreateTask(string.Empty, out var task),
                         nameof(NIDaqNative.DAQmxCreateTask));
-
                     var error = NIDaqNative.DAQmxCreateAOVoltageChan(
                         task,
                         physicalChannel,
@@ -250,15 +195,15 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
                         maximumValue,
                         NIDaqNative.ValVolts,
                         string.Empty);
-
                     if (error < 0)
                     {
-                        ClearTask(ref task);
+                        ReleaseOne(ref task);
                         NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxCreateAOVoltageChan));
                     }
 
-                    _aoTasks[key] = task;
-                    WriteLog(nameof(ConfigureAoChannel),
+                    _analogOutputs[key] = task;
+                    PublishLog(
+                        nameof(ConfigureAoChannel),
                         $"AO channel configured: {physicalChannel}, range=[{minimumValue}, {maximumValue}].");
                 }
 
@@ -271,72 +216,44 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
 
         public bool WriteAoSinglePoint(double value)
         {
-            lock (_sync)
+            lock (_gate)
             {
                 try
                 {
-                    EnsureInitialized();
-                    if (_aoKey is null || !_aoTasks.TryGetValue(_aoKey, out var task))
+                    RequireReady();
+                    if (_aoKey is null || !_analogOutputs.TryGetValue(_aoKey, out var task))
                         throw new InvalidOperationException("NI-DAQmx AO task is not created.");
 
                     var error = NIDaqNative.DAQmxWriteAnalogScalarF64(task, 1, 10.0, value, IntPtr.Zero);
-
-                    if (IsUsbAbortError(error) && TryRecoverDevice("AO write"))
+                    if (IsAbort(error) && ResetAfterAbort("AO write"))
                     {
                         ConfigureAoChannel(_aoChannel!, _aoMin, _aoMax);
-                        _aoTasks.TryGetValue(_aoKey!, out task);
+                        _analogOutputs.TryGetValue(_aoKey!, out task);
                         error = NIDaqNative.DAQmxWriteAnalogScalarF64(task, 1, 10.0, value, IntPtr.Zero);
                     }
 
                     NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxWriteAnalogScalarF64));
-                    WriteLog(nameof(WriteAoSinglePoint), $"AO write success: value={value}.");
+                    PublishLog(nameof(WriteAoSinglePoint), $"AO write success: value={value}.");
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    WriteException(nameof(WriteAoSinglePoint), ex);
+                    PublishException(nameof(WriteAoSinglePoint), ex);
                     return false;
                 }
             }
         }
 
-        // ═══════════════════ DI ═══════════════════
-
-        public byte ReadDiPort(string port)
-        {
-            lock (_sync)
-            {
-                EnsureInitialized();
-                var task = GetOrCreateDiTask(port, NIDaqNative.ValChanForAllLines);
-
-                var buffer = new byte[1];
-                var error = NIDaqNative.DAQmxReadDigitalU8(
-                    task, 1, 10.0, NIDaqNative.ValGroupByChannel, buffer, 1, out _, IntPtr.Zero);
-
-                if (IsUsbAbortError(error) && TryRecoverDevice("DI port read"))
-                {
-                    task = GetOrCreateDiTask(port, NIDaqNative.ValChanForAllLines);
-                    error = NIDaqNative.DAQmxReadDigitalU8(
-                        task, 1, 10.0, NIDaqNative.ValGroupByChannel, buffer, 1, out _, IntPtr.Zero);
-                }
-
-                NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxReadDigitalU8));
-                return buffer[0];
-            }
-        }
-
         public bool ReadDiLine(string line)
         {
-            lock (_sync)
+            lock (_gate)
             {
-                EnsureInitialized();
-                var task = GetOrCreateDiTask(line, NIDaqNative.ValChanPerLine);
-
+                RequireReady();
+                var task = DigitalInputTask(line);
                 var error = NIDaqNative.DAQmxReadDigitalScalarU32(task, 10.0, out var value, IntPtr.Zero);
-
-                if (IsUsbAbortError(error) && TryRecoverDevice("DI line read"))
+                if (IsAbort(error) && ResetAfterAbort("DI line read"))
                 {
-                    task = GetOrCreateDiTask(line, NIDaqNative.ValChanPerLine);
+                    task = DigitalInputTask(line);
                     error = NIDaqNative.DAQmxReadDigitalScalarU32(task, 10.0, out value, IntPtr.Zero);
                 }
 
@@ -345,117 +262,97 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
             }
         }
 
-        // ═══════════════════ DO ═══════════════════
-
-        public bool WriteDoPort(string port, byte value)
-        {
-            lock (_sync)
-            {
-                try
-                {
-                    EnsureInitialized();
-                    var task = GetOrCreateDoTask(port, NIDaqNative.ValChanForAllLines);
-
-                    var data = new[] { value };
-                    var error = NIDaqNative.DAQmxWriteDigitalU8(
-                        task, 1, 1, 10.0, NIDaqNative.ValGroupByChannel, data, out _, IntPtr.Zero);
-
-                    if (IsUsbAbortError(error) && TryRecoverDevice("DO port write"))
-                    {
-                        task = GetOrCreateDoTask(port, NIDaqNative.ValChanForAllLines);
-                        error = NIDaqNative.DAQmxWriteDigitalU8(
-                            task, 1, 1, 10.0, NIDaqNative.ValGroupByChannel, data, out _, IntPtr.Zero);
-                    }
-
-                    NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxWriteDigitalU8));
-                    WriteLog(nameof(WriteDoPort), $"DO port write success: {port} = 0x{value:X2}.");
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    WriteException(nameof(WriteDoPort), ex);
-                    return false;
-                }
-            }
-        }
-
         public bool WriteDoLine(string line, bool value)
         {
-            lock (_sync)
+            lock (_gate)
             {
                 try
                 {
-                    EnsureInitialized();
-                    var task = GetOrCreateDoTask(line, NIDaqNative.ValChanPerLine);
-
+                    RequireReady();
+                    var task = DigitalOutputTask(line);
                     var error = NIDaqNative.DAQmxWriteDigitalScalarU32(
                         task, 1, 10.0, value ? 1u : 0u, IntPtr.Zero);
-
-                    if (IsUsbAbortError(error) && TryRecoverDevice("DO line write"))
+                    if (IsAbort(error) && ResetAfterAbort("DO line write"))
                     {
-                        task = GetOrCreateDoTask(line, NIDaqNative.ValChanPerLine);
+                        task = DigitalOutputTask(line);
                         error = NIDaqNative.DAQmxWriteDigitalScalarU32(
                             task, 1, 10.0, value ? 1u : 0u, IntPtr.Zero);
                     }
 
                     NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxWriteDigitalScalarU32));
-                    WriteLog(nameof(WriteDoLine), $"DO line write success: {line} = {value}.");
+                    PublishLog(nameof(WriteDoLine), $"DO line write success: {line} = {value}.");
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    WriteException(nameof(WriteDoLine), ex);
+                    PublishException(nameof(WriteDoLine), ex);
                     return false;
                 }
             }
         }
 
-        // ═══════════════════ Task 缓存/恢复 ═══════════════════
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
 
-        private static string AiKey(string channel, double min, double max, int term)
-            => $"{channel}|{min}|{max}|{term}";
+            lock (_gate)
+            {
+                if (_disposed)
+                    return;
 
-        private void SetCurrentAi(string key, string channel, double min, double max, int term)
+                var deviceName = _deviceName;
+                ReleaseEveryTask();
+                if (Initialized)
+                    PublishLog(nameof(Dispose), $"Disposed. Device='{deviceName}'.");
+
+                Initialized = false;
+                _deviceName = string.Empty;
+                _disposed = true;
+            }
+        }
+
+        private static string AiKey(string channel, double min, double max, int terminal)
+            => $"{channel}|{min}|{max}|{terminal}";
+
+        private void RememberAi(string key, string channel, double min, double max, int terminal)
         {
             _aiKey = key;
             _aiChannel = channel;
             _aiMin = min;
             _aiMax = max;
-            _aiTerm = term;
+            _aiTerminal = terminal;
         }
 
-        private IntPtr CurrentAiTask()
+        private IntPtr AiTaskOrThrow()
         {
-            if (_aiKey is null || !_aiTasks.TryGetValue(_aiKey, out var task) || task == IntPtr.Zero)
+            if (_aiKey is null || !_analogInputs.TryGetValue(_aiKey, out var task) || task == IntPtr.Zero)
                 throw new InvalidOperationException("NI-DAQmx AI task is not created. Call ConfigureAiChannel first.");
             return task;
         }
 
-        private void CreateAndCacheAiTask(string channel, double min, double max, int term)
+        private void OpenAndStoreAi(string channel, double min, double max, int terminal)
         {
-            var key = AiKey(channel, min, max, term);
-            if (_aiTasks.TryGetValue(key, out var old))
+            var key = AiKey(channel, min, max, terminal);
+            if (_analogInputs.TryGetValue(key, out var previous))
             {
-                ClearTask(ref old);
-                _aiTasks.Remove(key);
+                ReleaseOne(ref previous);
+                _analogInputs.Remove(key);
             }
 
-            var (task, _) = CreateAiTaskCore(channel, min, max, term);
-            _aiTasks[key] = task;
-            SetCurrentAi(key, channel, min, max, term);
+            var (task, _) = OpenAiTask(channel, min, max, terminal);
+            _analogInputs[key] = task;
+            RememberAi(key, channel, min, max, terminal);
         }
 
-        private (IntPtr task, int appliedTerm) CreateAiTaskCore(string channel, double min, double max, int term)
+        private (IntPtr task, int appliedTerminal) OpenAiTask(string channel, double min, double max, int terminal)
         {
-            var candidates = BuildTerminalConfigCandidates(term);
             Exception? lastError = null;
-
-            foreach (var config in candidates)
+            foreach (var config in TerminalCandidates(terminal))
             {
                 NIDaqNative.ThrowIfFailed(
                     NIDaqNative.DAQmxCreateTask(string.Empty, out var task),
                     nameof(NIDaqNative.DAQmxCreateTask));
-
                 var error = NIDaqNative.DAQmxCreateAIVoltageChan(
                     task,
                     channel,
@@ -465,100 +362,81 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
                     max,
                     NIDaqNative.ValVolts,
                     string.Empty);
-
                 if (error >= 0)
                     return (task, config);
 
-                ClearTask(ref task);
+                ReleaseOne(ref task);
                 lastError = new InvalidOperationException(
                     $"{nameof(NIDaqNative.DAQmxCreateAIVoltageChan)} failed ({error}): {NIDaqNative.GetExtendedErrorInfo()}");
-
-                // -200077：该通道不支持请求的接线方式，换下一种再试
-                if (error != -200077)
+                if (error != UnsupportedTerminal)
                     break;
             }
 
             throw lastError ?? new InvalidOperationException($"Failed to configure AI channel '{channel}'.");
         }
 
-        private static int[] BuildTerminalConfigCandidates(int preferred)
+        private static int[] TerminalCandidates(int preferred)
         {
-            var ordered = preferred == NIDaqNative.ValCfgDefault
-                ? new[]
-                {
-                    NIDaqNative.ValCfgDefault,
-                    NIDaqNative.ValRse,
-                    NIDaqNative.ValNrse,
-                    NIDaqNative.ValDiff
-                }
-                : new[]
-                {
-                    preferred,
-                    NIDaqNative.ValCfgDefault,
-                    NIDaqNative.ValRse,
-                    NIDaqNative.ValNrse,
-                    NIDaqNative.ValDiff
-                };
+            var fallback = new[]
+            {
+                NIDaqNative.ValCfgDefault,
+                NIDaqNative.ValRse,
+                NIDaqNative.ValNrse,
+                NIDaqNative.ValDiff
+            };
+            if (preferred == NIDaqNative.ValCfgDefault)
+                return fallback;
 
-            return ordered.Distinct().ToArray();
+            return new[] { preferred }.Concat(fallback).Distinct().ToArray();
         }
 
-        private IntPtr GetOrCreateDiTask(string lines, int grouping)
+        private IntPtr DigitalInputTask(string lines)
         {
-            if (_diTasks.TryGetValue(lines, out var existing) && existing != IntPtr.Zero)
+            if (_digitalInputs.TryGetValue(lines, out var existing) && existing != IntPtr.Zero)
                 return existing;
 
             NIDaqNative.ThrowIfFailed(
                 NIDaqNative.DAQmxCreateTask(string.Empty, out var task),
                 nameof(NIDaqNative.DAQmxCreateTask));
-
-            var error = NIDaqNative.DAQmxCreateDIChan(task, lines, string.Empty, grouping);
+            var error = NIDaqNative.DAQmxCreateDIChan(task, lines, string.Empty, NIDaqNative.ValChanPerLine);
             if (error < 0)
             {
-                ClearTask(ref task);
+                ReleaseOne(ref task);
                 NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxCreateDIChan));
             }
 
-            _diTasks[lines] = task;
+            _digitalInputs[lines] = task;
             return task;
         }
 
-        private IntPtr GetOrCreateDoTask(string lines, int grouping)
+        private IntPtr DigitalOutputTask(string lines)
         {
-            if (_doTasks.TryGetValue(lines, out var existing) && existing != IntPtr.Zero)
+            if (_digitalOutputs.TryGetValue(lines, out var existing) && existing != IntPtr.Zero)
                 return existing;
 
             NIDaqNative.ThrowIfFailed(
                 NIDaqNative.DAQmxCreateTask(string.Empty, out var task),
                 nameof(NIDaqNative.DAQmxCreateTask));
-
-            var error = NIDaqNative.DAQmxCreateDOChan(task, lines, string.Empty, grouping);
+            var error = NIDaqNative.DAQmxCreateDOChan(task, lines, string.Empty, NIDaqNative.ValChanPerLine);
             if (error < 0)
             {
-                ClearTask(ref task);
+                ReleaseOne(ref task);
                 NIDaqNative.ThrowIfFailed(error, nameof(NIDaqNative.DAQmxCreateDOChan));
             }
 
-            _doTasks[lines] = task;
+            _digitalOutputs[lines] = task;
             return task;
         }
 
-        private static bool IsUsbAbortError(int error) =>
-            error == ErrorTransferAborted || error == ErrorResourceReserved;
+        private static bool IsAbort(int error) => error == UsbTransferAborted || error == ResourceReserved;
 
-        /// <summary>
-        /// -50405 后设备处于坏状态：清掉全部 Task 并 ResetDevice。
-        /// 带节流：距上次复位不足 5s 时只清 Task 不复位（避免复位风暴反而加剧 abort）。
-        /// </summary>
-        private bool TryRecoverDevice(string reason)
+        private bool ResetAfterAbort(string reason)
         {
-            ClearAllTasks();
-
+            ReleaseEveryTask();
             var now = DateTime.UtcNow;
-            if (now - _lastResetUtc < ResetThrottle)
+            if (now - _lastResetUtc < ResetInterval)
             {
-                WriteLog(nameof(TryRecoverDevice),
-                    $"USB abort during {reason}; tasks cleared (device reset throttled).");
+                PublishLog("TryRecoverDevice", $"USB abort during {reason}; tasks cleared (device reset throttled).");
                 return true;
             }
 
@@ -568,65 +446,67 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
                 var error = NIDaqNative.DAQmxResetDevice(_deviceName);
                 if (error < 0)
                 {
-                    WriteLog(nameof(TryRecoverDevice),
+                    PublishLog(
+                        "TryRecoverDevice",
                         $"DAQmxResetDevice('{_deviceName}') after {reason} returned {error}: {NIDaqNative.GetExtendedErrorInfo()}");
                     return false;
                 }
 
-                // 给设备一点时间恢复枚举（仅在罕见的恢复路径上）
                 Thread.Sleep(200);
-                WriteLog(nameof(TryRecoverDevice),
-                    $"Device '{_deviceName}' reset after USB abort during {reason}.");
+                PublishLog("TryRecoverDevice", $"Device '{_deviceName}' reset after USB abort during {reason}.");
                 return true;
             }
             catch (Exception ex)
             {
-                WriteLog(nameof(TryRecoverDevice), $"DAQmxResetDevice threw: {ex.Message}");
+                PublishLog("TryRecoverDevice", $"DAQmxResetDevice threw: {ex.Message}");
                 return false;
             }
         }
 
-        private void ClearAllTasks()
+        private void ReleaseEveryTask()
         {
-            foreach (var dict in new[] { _aiTasks, _diTasks, _doTasks, _aoTasks })
+            foreach (var tasks in new[] { _analogInputs, _digitalInputs, _digitalOutputs, _analogOutputs })
             {
-                foreach (var handle in dict.Values)
+                foreach (var handle in tasks.Values)
                 {
                     var task = handle;
-                    ClearTask(ref task);
+                    ReleaseOne(ref task);
                 }
-                dict.Clear();
+
+                tasks.Clear();
             }
         }
 
-        /// <summary>只 Clear（内部含停止），不先 Stop，减少多余的 USB abort。</summary>
-        private static void ClearTask(ref IntPtr task)
+        private static void ReleaseOne(ref IntPtr task)
         {
             if (task == IntPtr.Zero)
                 return;
 
-            try { NIDaqNative.DAQmxClearTask(task); } catch { }
+            try
+            {
+                NIDaqNative.DAQmxClearTask(task);
+            }
+            catch
+            {
+                // Clearing a task that the driver already dropped is not fatal.
+            }
+
             task = IntPtr.Zero;
         }
 
-        // ═══════════════════ 设备名解析/工具 ═══════════════════
-
-        private string ResolveDeviceName(string? deviceName)
+        private string PickDeviceName(string? deviceName)
         {
-            var preferred = StripConnectionPrefix(deviceName);
-            var devices = EnumerateDevices();
-
+            var preferred = WithoutPrefix(deviceName);
+            var devices = ListDevices();
             if (!string.IsNullOrWhiteSpace(preferred))
             {
-                var match = devices.FirstOrDefault(d =>
-                    d.Equals(preferred, StringComparison.OrdinalIgnoreCase));
+                var match = devices.FirstOrDefault(d => d.Equals(preferred, StringComparison.OrdinalIgnoreCase));
                 if (match != null)
                     return match;
 
                 if (devices.Count == 0)
                 {
-                    WriteLog(nameof(ResolveDeviceName),
-                        $"Device list empty; using requested name '{preferred}'.");
+                    PublishLog("ResolveDeviceName", $"Device list empty; using requested name '{preferred}'.");
                     return preferred;
                 }
 
@@ -641,7 +521,33 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
             return devices[0];
         }
 
-        private static string StripConnectionPrefix(string? value)
+        private static IReadOnlyList<string> ListDevices()
+        {
+            try
+            {
+                var buffer = new byte[4096];
+                NIDaqNative.ThrowIfFailed(
+                    NIDaqNative.DAQmxGetSystemInfoAttribute(NIDaqNative.SysDevNames, buffer, buffer.Length),
+                    nameof(NIDaqNative.DAQmxGetSystemInfoAttribute));
+                var text = Encoding.ASCII.GetString(buffer);
+                var end = text.IndexOf('\0');
+                if (end >= 0)
+                    text = text[..end];
+
+                return text
+                    .Split(new[] { ',', '\0' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(s => s.Trim())
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .OrderBy(s => s)
+                    .ToList();
+            }
+            catch
+            {
+                return Array.Empty<string>();
+            }
+        }
+
+        private static string WithoutPrefix(string? value)
         {
             if (string.IsNullOrWhiteSpace(value))
                 return string.Empty;
@@ -649,27 +555,26 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
             var text = value.Trim();
             foreach (var prefix in new[] { "NIDAQ://", "NI-DAQ://", "NI://", "DAQ://" })
             {
-                if (text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    text = text[prefix.Length..].Trim();
-                    break;
-                }
+                if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                text = text[prefix.Length..].Trim();
+                break;
             }
 
             var semi = text.IndexOf(';');
             if (semi >= 0)
                 text = text[..semi].Trim();
-
             return text;
         }
 
-        private void EnsureInitialized()
+        private void RequireReady()
         {
             if (!Initialized)
                 throw new InvalidOperationException("NIDaqInterop not initialized. Call Initialize() first.");
         }
 
-        private void WriteLog(string method, string message)
+        private void PublishLog(string method, string message)
         {
             OnExecuteLog?.Invoke(this, new ExecuteLogEvent
             {
@@ -679,40 +584,17 @@ namespace DeviceCommunication.Protocols.IOCard.NationalInstruments
             });
         }
 
-        private void WriteException(string method, Exception ex)
+        private void PublishException(string method, Exception ex)
         {
             var message = ex.InnerException == null
                 ? $"{ex.Message} (0x{ex.HResult:X8})"
                 : $"{ex.Message} (0x{ex.HResult:X8}) -> {ex.InnerException.Message}";
-
             OnException?.Invoke(this, new ExceptionEvent
             {
                 ClassName = nameof(NIDaqInterop),
                 MethodName = method,
                 ErrorMessage = message
             });
-        }
-
-        public void Dispose()
-        {
-            if (_disposed)
-                return;
-
-            lock (_sync)
-            {
-                if (_disposed)
-                    return;
-
-                var deviceName = _deviceName;
-                ClearAllTasks();
-
-                if (Initialized)
-                    WriteLog(nameof(Dispose), $"Disposed. Device='{deviceName}'.");
-
-                Initialized = false;
-                _deviceName = string.Empty;
-                _disposed = true;
-            }
         }
     }
 }

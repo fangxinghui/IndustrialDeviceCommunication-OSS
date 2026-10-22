@@ -8,30 +8,29 @@ using System.Threading;
 namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
 {
     /// <summary>
-    /// ART-DAQ 封装：设备枚举、AI 电流连续采样 + 最新值 + 环形缓冲。
-    /// USB3145A：±20mA，内置分流，差分，默认同步采 ai0:7。
+    /// Continuous 8-channel current acquisition on an ART USB3145A through Art_DAQ.dll.
+    /// Samples are stored oldest-to-newest for one second, and the latest value of each channel is kept aside.
     /// </summary>
     internal sealed class ArtDaqInterop : IDisposable
     {
         public const int ChannelCount = 8;
-        public const double MinCurrentAmps = -0.02;
-        public const double MaxCurrentAmps = 0.02;
-        public const double DefaultSampleRateHz = 10000.0;
-        public const double MaxSampleRateHz = 500000.0;
+        private const double MinCurrentAmps = -0.02;
+        private const double MaxCurrentAmps = 0.02;
+        private const double DefaultSampleRateHz = 10000.0;
+        private const double MaxSampleRateHz = 500000.0;
         private const double RingCapacitySeconds = 1.0;
 
-        private readonly object _sync = new();
+        private readonly object _gate = new();
         private readonly double[] _latestAmps = new double[ChannelCount];
         private readonly bool[] _hasLatest = new bool[ChannelCount];
 
-        private double[] _ring = Array.Empty<double>(); // interleaved: sample * ChannelCount + ch
+        private double[] _ring = Array.Empty<double>();
         private int _ringCapacity;
         private int _ringCount;
         private int _ringWrite;
-
         private string _deviceName = string.Empty;
         private IntPtr _task = IntPtr.Zero;
-        private Thread? _readerThread;
+        private Thread? _reader;
         private volatile bool _runReader;
         private double _sampleRateHz = DefaultSampleRateHz;
         private int _readChunk;
@@ -47,8 +46,8 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             try
             {
                 ArtDaqNative.EnsureLoaded();
-                _deviceName = ResolveDeviceName(connectionParameters);
-                _sampleRateHz = ParseSampleRateHz(connectionParameters);
+                _deviceName = PickDeviceName(connectionParameters);
+                _sampleRateHz = ReadSampleRate(connectionParameters);
                 Initialized = !string.IsNullOrWhiteSpace(_deviceName);
                 return Initialized;
             }
@@ -61,27 +60,23 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
 
         public void StartContinuous(double? sampleRateHz = null)
         {
-            EnsureInitialized();
+            RequireReady();
             StopContinuous();
-
             if (sampleRateHz is > 0)
-                _sampleRateHz = ClampSampleRate(sampleRateHz.Value);
+                _sampleRateHz = ClampRate(sampleRateHz.Value);
 
             _readChunk = Math.Max(100, (int)Math.Round(_sampleRateHz * 0.1));
-            AllocateRing(Math.Max(1000, (int)Math.Ceiling(_sampleRateHz * RingCapacitySeconds)));
-
-            var physicalChannel = $"{_deviceName}/ai0:7";
+            ResetRing(Math.Max(1000, (int)Math.Ceiling(_sampleRateHz * RingCapacitySeconds)));
 
             ArtDaqNative.ThrowIfFailed(
                 ArtDaqNative.ArtDAQ_CreateTask(string.Empty, out _task),
                 "ArtDAQ_CreateTask");
-
             try
             {
                 ArtDaqNative.ThrowIfFailed(
                     ArtDaqNative.ArtDAQ_CreateAICurrentChan(
                         _task,
-                        physicalChannel,
+                        $"{_deviceName}/ai0:7",
                         string.Empty,
                         ArtDaqNative.ValDiff,
                         MinCurrentAmps,
@@ -91,7 +86,6 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
                         0.0,
                         string.Empty),
                     "ArtDAQ_CreateAICurrentChan");
-
                 ArtDaqNative.ThrowIfFailed(
                     ArtDaqNative.ArtDAQ_CfgSampClkTiming(
                         _task,
@@ -101,42 +95,50 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
                         ArtDaqNative.ValContSamps,
                         _readChunk),
                     "ArtDAQ_CfgSampClkTiming");
-
                 ArtDaqNative.ThrowIfFailed(
                     ArtDaqNative.ArtDAQ_StartTask(_task),
                     "ArtDAQ_StartTask");
             }
             catch
             {
-                ClearTask();
+                DropTask();
                 throw;
             }
 
             _runReader = true;
-            _readerThread = new Thread(ReaderLoop)
+            _reader = new Thread(ReadLoop)
             {
                 IsBackground = true,
                 Name = $"ArtDAQ-{_deviceName}-AI"
             };
-            _readerThread.Start();
+            _reader.Start();
             ContinuousRunning = true;
         }
 
         public void StopContinuous()
         {
             _runReader = false;
-            var thread = _readerThread;
-            _readerThread = null;
+            var thread = _reader;
+            _reader = null;
             if (thread != null && thread.IsAlive)
             {
                 if (!thread.Join(3000))
                 {
-                    try { if (_task != IntPtr.Zero) ArtDaqNative.ArtDAQ_StopTask(_task); } catch { }
+                    try
+                    {
+                        if (_task != IntPtr.Zero)
+                            ArtDaqNative.ArtDAQ_StopTask(_task);
+                    }
+                    catch
+                    {
+                        // The reader may already have stopped the task.
+                    }
+
                     thread.Join(2000);
                 }
             }
 
-            ClearTask();
+            DropTask();
             ContinuousRunning = false;
         }
 
@@ -146,10 +148,11 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             if (channelIndex < 0 || channelIndex >= ChannelCount)
                 return false;
 
-            lock (_sync)
+            lock (_gate)
             {
                 if (!_hasLatest[channelIndex])
                     return false;
+
                 amps = _latestAmps[channelIndex];
                 return true;
             }
@@ -161,7 +164,7 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             if (startChannel < 0 || count <= 0 || startChannel + count > ChannelCount)
                 return false;
 
-            lock (_sync)
+            lock (_gate)
             {
                 var result = new double[count];
                 for (var i = 0; i < count; i++)
@@ -176,12 +179,9 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             }
         }
 
-        /// <summary>
-        /// 拷贝环形缓冲最近样本，维度 [sample, channel]，单位 A，时间从旧到新。
-        /// </summary>
         public bool TryCopyRecentSamples(out double[,] samplesByIndexThenChannel, out int sampleCount)
         {
-            lock (_sync)
+            lock (_gate)
             {
                 sampleCount = _ringCount;
                 if (sampleCount <= 0 || _ringCapacity <= 0)
@@ -195,41 +195,29 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
                 for (var i = 0; i < sampleCount; i++)
                 {
                     var ringIndex = (start + i) % _ringCapacity;
-                    var baseOffset = ringIndex * ChannelCount;
-                    for (var ch = 0; ch < ChannelCount; ch++)
-                        samplesByIndexThenChannel[i, ch] = _ring[baseOffset + ch];
+                    var origin = ringIndex * ChannelCount;
+                    for (var channel = 0; channel < ChannelCount; channel++)
+                        samplesByIndexThenChannel[i, channel] = _ring[origin + channel];
                 }
 
                 return true;
             }
         }
 
-        public IReadOnlyList<string> EnumerateDevices()
+        public void Dispose()
         {
-            ArtDaqNative.EnsureLoaded();
+            if (_disposed)
+                return;
 
-            var buffer = new byte[4096];
-            var error = ArtDaqNative.ArtDAQ_GetSystemAttribute(ArtDaqNative.SysDevNames, buffer, buffer.Length);
-            if (error < 0)
-                return Array.Empty<string>();
-
-            var text = Encoding.Default.GetString(buffer);
-            var nullIndex = text.IndexOf('\0');
-            if (nullIndex >= 0)
-                text = text[..nullIndex];
-
-            return text
-                .Split(new[] { ',', ';', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(s => s.Trim())
-                .Where(s => !string.IsNullOrWhiteSpace(s))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            StopContinuous();
+            Initialized = false;
+            _deviceName = string.Empty;
+            _disposed = true;
         }
 
-        private void AllocateRing(int capacitySamples)
+        private void ResetRing(int capacitySamples)
         {
-            lock (_sync)
+            lock (_gate)
             {
                 _ringCapacity = Math.Max(1, capacitySamples);
                 _ring = new double[_ringCapacity * ChannelCount];
@@ -240,7 +228,7 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             }
         }
 
-        private void ReaderLoop()
+        private void ReadLoop()
         {
             var buffer = new double[_readChunk * ChannelCount];
             while (_runReader && _task != IntPtr.Zero)
@@ -256,24 +244,22 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
                         (uint)buffer.Length,
                         out var sampsPerChan,
                         IntPtr.Zero);
-
                     if (!_runReader)
                         break;
-
                     if (error < 0 || sampsPerChan <= 0)
                         continue;
 
-                    lock (_sync)
+                    lock (_gate)
                     {
-                        for (var s = 0; s < sampsPerChan; s++)
+                        for (var sample = 0; sample < sampsPerChan; sample++)
                         {
-                            var baseOffset = _ringWrite * ChannelCount;
-                            for (var ch = 0; ch < ChannelCount; ch++)
+                            var origin = _ringWrite * ChannelCount;
+                            for (var channel = 0; channel < ChannelCount; channel++)
                             {
-                                var amps = buffer[ch * sampsPerChan + s];
-                                _ring[baseOffset + ch] = amps;
-                                _latestAmps[ch] = amps;
-                                _hasLatest[ch] = true;
+                                var amps = buffer[channel * sampsPerChan + sample];
+                                _ring[origin + channel] = amps;
+                                _latestAmps[channel] = amps;
+                                _hasLatest[channel] = true;
                             }
 
                             _ringWrite = (_ringWrite + 1) % _ringCapacity;
@@ -291,25 +277,39 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             }
         }
 
-        private void ClearTask()
+        private void DropTask()
         {
             if (_task == IntPtr.Zero)
                 return;
 
-            try { ArtDaqNative.ArtDAQ_StopTask(_task); } catch { }
-            try { ArtDaqNative.ArtDAQ_ClearTask(_task); } catch { }
+            try
+            {
+                ArtDaqNative.ArtDAQ_StopTask(_task);
+            }
+            catch
+            {
+                // Stop can fail once the task is already stopped.
+            }
+
+            try
+            {
+                ArtDaqNative.ArtDAQ_ClearTask(_task);
+            }
+            catch
+            {
+                // Clear can fail once the driver has released the task.
+            }
+
             _task = IntPtr.Zero;
         }
 
-        private string ResolveDeviceName(string? connectionParameters)
+        private string PickDeviceName(string? connectionParameters)
         {
-            var preferred = StripConnectionPrefix(connectionParameters);
-            var devices = EnumerateDevices();
-
+            var preferred = WithoutPrefix(connectionParameters);
+            var devices = ListDevices();
             if (!string.IsNullOrWhiteSpace(preferred))
             {
-                var match = devices.FirstOrDefault(d =>
-                    d.Equals(preferred, StringComparison.OrdinalIgnoreCase));
+                var match = devices.FirstOrDefault(d => d.Equals(preferred, StringComparison.OrdinalIgnoreCase));
                 return match ?? preferred;
             }
 
@@ -320,7 +320,28 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
                 "No ART-DAQ device found. Install ART-DAQ, connect USB3145A, and check DMC device name (e.g. Dev1).");
         }
 
-        public static string StripConnectionPrefix(string? value)
+        private static IReadOnlyList<string> ListDevices()
+        {
+            ArtDaqNative.EnsureLoaded();
+            var buffer = new byte[4096];
+            if (ArtDaqNative.ArtDAQ_GetSystemAttribute(ArtDaqNative.SysDevNames, buffer, buffer.Length) < 0)
+                return Array.Empty<string>();
+
+            var text = Encoding.Default.GetString(buffer);
+            var end = text.IndexOf('\0');
+            if (end >= 0)
+                text = text[..end];
+
+            return text
+                .Split(new[] { ',', ';', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static string WithoutPrefix(string? value)
         {
             if (string.IsNullOrWhiteSpace(value))
                 return string.Empty;
@@ -328,63 +349,52 @@ namespace DeviceCommunication.Protocols.IOCard.ArtTechnology
             var text = value.Trim();
             foreach (var prefix in new[] { "ArtDAQ://", "ARTDAQ://", "PCIE://", "USB://" })
             {
-                if (text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    text = text[prefix.Length..].Trim();
-                    break;
-                }
+                if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                text = text[prefix.Length..].Trim();
+                break;
             }
 
             var semi = text.IndexOf(';');
             if (semi >= 0)
                 text = text[..semi].Trim();
-
             return text;
         }
 
-        public static double ParseSampleRateHz(string? connectionParameters)
+        private static double ReadSampleRate(string? connectionParameters)
         {
             if (string.IsNullOrWhiteSpace(connectionParameters))
                 return DefaultSampleRateHz;
 
             foreach (var part in connectionParameters.Split(';'))
             {
-                var kv = part.Split(new[] { '=' }, 2);
-                if (kv.Length != 2)
+                var pair = part.Split(new[] { '=' }, 2);
+                if (pair.Length != 2)
                     continue;
-                if (!kv[0].Trim().Equals("SampleRate", StringComparison.OrdinalIgnoreCase) &&
-                    !kv[0].Trim().Equals("Rate", StringComparison.OrdinalIgnoreCase))
+                if (!pair[0].Trim().Equals("SampleRate", StringComparison.OrdinalIgnoreCase) &&
+                    !pair[0].Trim().Equals("Rate", StringComparison.OrdinalIgnoreCase))
                     continue;
-
-                if (double.TryParse(kv[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var rate))
-                    return ClampSampleRate(rate);
+                if (double.TryParse(pair[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var rate))
+                    return ClampRate(rate);
             }
 
             return DefaultSampleRateHz;
         }
 
-        private static double ClampSampleRate(double rateHz)
+        private static double ClampRate(double rateHz)
         {
-            if (rateHz < 1.0) return 1.0;
-            if (rateHz > MaxSampleRateHz) return MaxSampleRateHz;
+            if (rateHz < 1.0)
+                return 1.0;
+            if (rateHz > MaxSampleRateHz)
+                return MaxSampleRateHz;
             return rateHz;
         }
 
-        private void EnsureInitialized()
+        private void RequireReady()
         {
             if (!Initialized || string.IsNullOrWhiteSpace(_deviceName))
                 throw new InvalidOperationException("ART-DAQ device is not initialized.");
-        }
-
-        public void Dispose()
-        {
-            if (_disposed)
-                return;
-
-            StopContinuous();
-            Initialized = false;
-            _deviceName = string.Empty;
-            _disposed = true;
         }
     }
 }

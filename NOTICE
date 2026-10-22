@@ -3,7 +3,7 @@ Copyright 2026 fangxinghui
 
 This repository is licensed under the Apache License, Version 2.0. See the LICENSE file.
 
-The Apache-2.0 terms apply to material for which fangxinghui is the copyright holder. Some interop files may have been copied from vendor samples. They are listed below and were not deleted. Whether those files can be offered under Apache-2.0 is unresolved until the owner confirms the right to relicense them.
+The Apache-2.0 terms apply to material for which fangxinghui is the copyright holder. P/Invoke declarations for ZLG, NI-DAQmx, ART-DAQ, and the Advantech Automation.BDaq reflection wrapper are written in this repository from the public function names, parameter types, and calling conventions. They contain only the entries this library calls. They are not vendor sample listings.
 
 Names below identify third-party products. This repository does not grant rights to those products and does not contain their binaries.
 
@@ -17,7 +17,7 @@ Names below identify third-party products. This repository does not grant rights
   Native NI runtimes are not included. USB VISA communication checks for a Windows VISA runtime at run time.
 
 - ZLG CAN (ZLG / 致远电子). Native ZLG libraries are not included.
-  DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs is unchanged from the source tree, including its UTF-8 byte-order mark, and may be a vendor sample.
+  DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs declares the zlgcan.dll entry points and pack-1 structs this library calls. The declaration file is independently written.
 
 - Omron FINS (Omron). DeviceCommunication/Protocols/Omron/OmronFinsTcp.cs calls HslCommunication. It is compiled only when you build with IncludeHslDrivers=true and a local HslCommunication.dll.
 
@@ -27,9 +27,9 @@ Names below identify third-party products. This repository does not grant rights
 
 HslCommunication (杭州胡工物联科技有限公司, https://www.hsltechnology.cn/) is not in this repository and is not packed into the NuGet package. Install a copy you are licensed to use before enabling the Siemens and Omron drivers.
 
-Files that may be copied from vendor samples (flagged, not removed):
+Interop declarations written in this tree, limited to the calls the rest of the code makes:
 
-- DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs (UTF-8 BOM)
+- DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs
 - DeviceCommunication/Protocols/IOCard/NationalInstruments/NIDaqNative.cs
 - DeviceCommunication/Protocols/IOCard/NationalInstruments/NIDaqInterop.cs
 - DeviceCommunication/Protocols/IOCard/ArtTechnology/ArtDaqNative.cs

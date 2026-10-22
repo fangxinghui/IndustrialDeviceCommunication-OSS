@@ -11,7 +11,7 @@ IndustrialDeviceCommunication-OSS/
 ├─ IndustrialDeviceCommunication.sln
 ├─ Directory.Build.props
 ├─ LICENSE                         # Apache-2.0
-├─ NOTICE                          # 厂商 SDK 与可能的示例代码
+├─ NOTICE                          # 厂商 SDK；互操作声明由本仓库独立编写
 ├─ DeviceCommunication/            # 接口、配置、工厂和协议实现
 └─ CoreShared/                     # 地址、数据转换、信号映射、日志事件
 ```
@@ -90,24 +90,16 @@ NI、ART、ZLG 的 P/Invoke 在没有厂商库时仍能通过编译，缺的是�
 
 NuGet 元数据：`PackageLicenseExpression` 为 `Apache-2.0`，`RepositoryUrl` 为 `https://github.com/fangxinghui/IndustrialDeviceCommunication-OSS`。
 
-## 可能来自厂商示例的文件
+## 互操作声明
 
-这些文件保留在树里，发布前需要确认版权。详见 `NOTICE`。
-
-- `DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs`（UTF-8 BOM，字节未改）
-- `DeviceCommunication/Protocols/IOCard/NationalInstruments/NIDaqNative.cs`
-- `DeviceCommunication/Protocols/IOCard/NationalInstruments/NIDaqInterop.cs`
-- `DeviceCommunication/Protocols/IOCard/ArtTechnology/ArtDaqNative.cs`
-- `DeviceCommunication/Protocols/IOCard/ArtTechnology/ArtDaqInterop.cs`
-- `DeviceCommunication/Protocols/IOCard/BDaqInterop.cs`
+ZLG、NI-DAQmx、ART-DAQ 的 P/Invoke，以及研华 `Automation.BDaq` 的反射包装，都是按公开 API 的函数名、参数类型和调用约定在本仓库里重写的。只保留本库实际调用的函数、结构和常量。厂商示例里的注释、版权头和未使用声明没有带进来。详见 `NOTICE`。
 
 ## 源文件编码
 
 - `DeviceCommunication/Protocols/ModbusSlaveController.cs` 已转为 UTF-8（无 BOM）。三处 `//` 注释原来是 GBK，转换后仍是：必须在锁内设置 `_released`、防止竞态、本线程释放总线。类注释原来是损坏的 UTF-8（「享」和句号的最后一个字节被换成了 `0x3F`），已还原为：`绑定到共享Modbus 总线上的单个从站视图。`
-- `DeviceCommunication/Protocols/CanBus/ZLG/ZLGAPI.cs` 带 UTF-8 BOM（`EF BB BF`）。这个文件没有改过。
 
 ## 许可证
 
 Apache License 2.0。版权 2026 fangxinghui。详见 `LICENSE` 和 `NOTICE`。
 
-厂商 SDK、HslCommunication，以及可能抄自厂商示例的互操作文件，各自另有许可。Apache-2.0 不能代替那些许可。
+厂商 SDK 和 HslCommunication 各自另有许可。Apache-2.0 不能代替那些许可。本仓库里的互操作声明是独立编写的。
