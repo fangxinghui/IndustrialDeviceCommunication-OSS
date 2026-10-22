@@ -1,0 +1,38 @@
+# Build outputs
+**/bin/
+**/obj/
+artifacts/
+*.nupkg
+*.snupkg
+
+# IDE state
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+~$*
+
+# Test and coverage outputs
+TestResults/
+coverage/
+coverage.*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Vendor binaries are not part of this repository.
+# Install Advantech DAQNavi, HslCommunication, and other vendor SDKs locally.
+dll/
+*.dll
+*.exe
+*.so
+*.dylib
